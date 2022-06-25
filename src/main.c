@@ -1,32 +1,19 @@
-/*
- * Paulo Pedreiras, 2022/03
- * Simple ADC example - nRF52840DK_nRF52840 board
- * 
- * 
- * Periodically reads ADC input and prints the corresponding raw and voltage value in the console
- * 
- * Adapted from: 
- *            https://devzone.nordicsemi.com/f/nordic-q-a/80685/using-saadc-in-nrf-connect-sdk/334204#334204
- *            https://github.com/simon-iversen/sdk-nrf/blob/light_controller/samples/light_controller/src/main.c
- * 
- *
- *      HW info
- *          https://infocenter.nordicsemi.com/topic/struct_nrf52/struct/nrf52840.html
- *          Section: nRF52840 Product Specification -> Peripherals -> GPIO / GPIOTE and SAADC 
- *          Board specific HW info can be found in the nRF52840_DK_User_Guide_20201203. I/O pins available at pg 27
- *
- *      Peripheral libs
- *          https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/zephyr/reference/peripherals/index.html
- *          ADC     
- *
- *      NOTE 1:     **** NEVER APPLY MORE THAN 3 V (VDD) or negative voltages to ANx ****
- *
- *      NOTE 2:     In this board analog inputs are AIN{1,2,4,5,6,7} (see nRF52840_DK_User_Guide_20201203, page 28)
- *                  Some of the examples found in the internet are set to AIN0 and so do not work. The PCB also has a label "A0", which refers to Arduino and induces in error. 
- *    
- *      NOTE 3:     must add "CONFIG_ADC=y" to prj.conf
- * 
- */
+ /** \file main.c
+* \brief Sistema de tempo real a simular controlo de iluminação.
+*
+*  Este código permite a leitura do valor em A0, utilizando a ADC.
+*  Existe uma primeira thread responsavel apenas por servir de relogio
+*  Uma outra thread apenas faz a leitura da ADC
+*  Outra thread faz uma filtragem (Média total).  
+*  Utiliza o valor final para dar feedback ao controlador.
+*  O controlador atua em uma nova thread
+*  A sincronização é feita através de semáforos.
+*  Existe uma ultima thread que usa o valor dado pelo controlador para controlar o duty cycle a aplicar ao led.
+*
+* \author Daniel Barra de Almeida        85111
+* \author Marco  Antonio da Silva Santos 83192
+* \date 25/06/2022
+*/
 
 #include <zephyr.h>
 #include <device.h>
@@ -153,8 +140,6 @@ static uint16_t adc_sample_buffer[BUFFER_SIZE];                     /*ADC ENDS*/
 /* Int related declarations */                          /* PWM STARTS */
 static struct gpio_callback but1_cb_data; /* Callback structure */
 
-/* Callback function and variables*/
-volatile int dcToggleFlag1 = 0; /* Flag to signal a BUT1 press */ 
 
 /* PWM configuration */
 unsigned int pwmPeriod_us = 10000;       /* PWM priod in us */
@@ -178,6 +163,12 @@ int end_minute = 0;
 int workmode_flip = 0;
 
 /* Takes one sample */
+/** \brief  Amostragem da ADC.
+*  Faz a leitura de uma amostra pela ADC.
+*
+* Esta função faz a leitura de uma amostra do sinal analógico
+* presente na porta A0 da placa.(Valor ente 0 e 1023 V)
+*/
 static int adc_sample(void)
 {
 	int ret;
@@ -250,6 +241,12 @@ void but1press_cbfunction(const struct device *dev, struct gpio_callback *cb, ui
 }
 
 // CONFIG
+/** \brief  Configuração.
+*  Configura a interface da placa.
+*
+* Esta função faz as configurações necessárias
+* para a interface da placa ser utilizada adequadamente.
+*/
 void config(void){
     int err=0;
 
@@ -339,6 +336,13 @@ void config(void){
     gpio_add_callback(gpio0_dev, &but1_cb_data);
 }
 
+/** \brief  Função principal.
+*  Inicio das threads.
+*
+* Esta é a funcao principal que logo de incio chama a funcção de configuração.
+* São inicializados semaforos e criadas as Threads/Tasks para o funcionamento
+* 
+*/
 void main(void)
 {
    printk("\x1b[2J");  /* Clear screen */
@@ -372,30 +376,15 @@ void main(void)
     thread_Out_tid = k_thread_create(&thread_Out_data, thread_Out_stack,
         K_THREAD_STACK_SIZEOF(thread_Out_stack), Output,
         NULL, NULL, NULL, thread_Out_prio, 0, K_NO_WAIT);
-
-    /* Main loop
-    while(true){
-        // Get one sample, checks for errors and prints the values 
-        err=adc_sample();
-        if(err) {
-            printk("adc_sample() failed with error code %d\n\r",err);
-        }
-        else {
-            if(adc_sample_buffer[0] > 1023) {
-                printk("adc reading out of range\n\r");
-            }
-            else {
-                // ADC is set to use gain of 1/4 and reference VDD/4, so input range is 0...VDD (3 V), with 10 bit resolution 
-                printk("adc reading: raw:%4u / %4u mV: \n\r",adc_sample_buffer[0],(uint16_t)(1000*adc_sample_buffer[0]*((float)3/1023)));
-            }
-        }
-
-        // Sleep a while ... 
-        k_msleep(TIMER_INTERVAL_MSEC);
-        
-    }*/
 }
 
+/** \brief  Clock Thread/Task.
+*  Relógio do sistema.
+*
+* Esta thread apenas é responsavel por manter um relogio funcional no sistema
+* de modo a se poderem programar periodos de tempo com funcionamentos diferentes.
+* 
+*/
 void Clock(void *argA , void *argB, void *argC)
 {
   int64_t time_stamp;
@@ -442,7 +431,17 @@ void Clock(void *argA , void *argB, void *argC)
   }
 }
 
-
+/** \brief  Thread Input.
+*  Funcionamento de aquisição da informação
+*
+* Leitura da ADC.
+* Conversão da escala de 0 a 1023 para 0 a 3000 (correspondente de 0 a 3 V).
+* Inserir o resultao da conversão na primeira memória partilhada.
+* Aumentar o valor do primeiro semáforo (k_sem_give).
+* Esperar pelo fim do periodo de amostragem.
+* Repete.
+* 
+*/
 void Input(void *argA , void *argB, void *argC)
 {
     /* Timing variables to control task periodicity */
@@ -511,6 +510,16 @@ void Input(void *argA , void *argB, void *argC)
     }
 }
 
+/** \brief  Filter Thread.
+*  Funcionamento de filtragem da informação
+*
+* Esperar pelo levantamento do semáforo (k_sem_take).
+* Retirar o valor presente na memoria partilhada e adicioná-lo a um vetor local, retirando o mais antigo.
+* Filtragem (Média total).
+* Inserir resultado numa segunda memória partilhada.
+* Aumentar o valor do segundo semáforo (k_sem_give).
+* 
+*/
 void Filter(void *argA , void *argB, void *argC)
 {
     /* Other variables */
@@ -552,6 +561,16 @@ void Filter(void *argA , void *argB, void *argC)
   }
 }
 
+/** \brief  Control Thread.
+*  Funcionamento de controlador PI
+*
+* Esperar pelo levantamento do semáforo (k_sem_take).
+* Retirar o valor presente na segunda memoria partilhada e usalo como valor de feedback do sistema.
+* Calculo do erro e do novo valor de entrada correspondente atraves de um controlador PI
+* Inserir resultado numa terceira memória partilhada.
+* Aumentar o valor do terceiro semáforo (k_sem_give).
+* 
+*/
 void Control(void *argA , void *argB, void *argC)
 {
   float Ki=0.005;
@@ -601,6 +620,16 @@ void Control(void *argA , void *argB, void *argC)
 
 }
 
+/** \brief  Thread Output.
+*  Funcionamento de saída da informação.
+*
+* Esperar o levantamento do terceiro semáforo (k_sem_take).
+* Ler o valor da terceira memória partilhada.
+* Mostrar no terminal os valores atualizados de controlo e o tempo de funcionamento.
+* Ajustar o duty-cycle do PWM aplicado ao LED1.
+* Repete.
+* 
+*/
 void Output(void *argA , void *argB, void *argC)
 {
     /* Local variables */
@@ -629,12 +658,6 @@ void Output(void *argA , void *argB, void *argC)
         if (ret)
         {
             printk("Error %d: failed to set pulse width\n", ret);
-        }
-
-        if (dcToggleFlag1)
-        {
-            printk("But 1 pressed!");
-            dcToggleFlag1 = 0;
         }
         
         printk("Time-> %d h %d min %d sec \x1b[0K\n",horas, minutos, segundos);
