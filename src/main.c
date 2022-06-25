@@ -41,6 +41,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include <console/console.h>
+
 /*ADC definitions and includes*/                                    /*ADC STARTS*/
 #include <hal/nrf_saadc.h>
 #define ADC_NID DT_NODELABEL(adc) 
@@ -56,7 +58,7 @@
 #define ADC_CHANNEL_INPUT NRF_SAADC_INPUT_AIN1 
 
 #define BUFFER_SIZE 1
-#define VECTOR_SIZE 10           /* Filter Local-Vector Size */
+#define VECTOR_SIZE 100           /* Filter Local-Vector Size */
 
 
 /* Other defines */
@@ -80,38 +82,59 @@
 #define STACK_SIZE 1024
 
 /* Thread scheduling priority */
+#define thread_Clock_prio 1
 #define thread_In_prio 1
 #define thread_Filter_prio 1
+#define thread_Control_prio 1
 #define thread_Out_prio 1
 
+
+#define MODE_MANUAL 1
+#define MODE_AUTO 2
+#define AUTO_WORKMODE_ON 1
+#define AUTO_WORKMODE_OFF 0
+
+
+
+
 /* Create thread stack space */
+K_THREAD_STACK_DEFINE(thread_Clock_stack, STACK_SIZE);
 K_THREAD_STACK_DEFINE(thread_In_stack, STACK_SIZE);
 K_THREAD_STACK_DEFINE(thread_Filter_stack, STACK_SIZE);
+K_THREAD_STACK_DEFINE(thread_Control_stack, STACK_SIZE);
 K_THREAD_STACK_DEFINE(thread_Out_stack, STACK_SIZE);
 
 /* Create variables for thread data */
+struct k_thread thread_Clock_data;
 struct k_thread thread_In_data;
 struct k_thread thread_Filter_data;
+struct k_thread thread_Control_data;
 struct k_thread thread_Out_data;
 
 /* Create task IDs */
+k_tid_t thread_Clock_tid;
 k_tid_t thread_In_tid;
 k_tid_t thread_Filter_tid;
+k_tid_t thread_Control_tid;
 k_tid_t thread_Out_tid;
 
 /* Global vars (shared memory) */
-int sm_1 = 0;
-int sm_2 = 0;
+int sharedmemory_1 = 0;
+int sharedmemory_2 = 0;
+int sharedmemory_3 = 0;
 const struct device *gpio0_dev;         /* Pointer to GPIO device structure */
 const struct device *pwm0_dev;          /* Pointer to PWM device structure */
 
 /* Semaphores for task synch */
-struct k_sem sem1;
-struct k_sem sem2;
+struct k_sem sem1; //Filter
+struct k_sem sem2; //Control
+struct k_sem sem3; //Output
 
 /* Thread code prototypes */
+void Clock(void *argA , void *argB, void *argC);
 void Input(void *argA , void *argB, void *argC);
 void Filter(void *argA , void *argB, void *argC);
+void Control(void *argA , void *argB, void *argC);
 void Output(void *argA , void *argB, void *argC);
 
 /* ADC channel configuration */
@@ -124,7 +147,6 @@ static const struct adc_channel_cfg my_channel_cfg = {              /*ADC STARTS
 };
 
 /* Global vars */
-struct k_timer my_timer;
 const struct device *adc_dev = NULL;
 static uint16_t adc_sample_buffer[BUFFER_SIZE];                     /*ADC ENDS*/
 
@@ -135,11 +157,25 @@ static struct gpio_callback but1_cb_data; /* Callback structure */
 volatile int dcToggleFlag1 = 0; /* Flag to signal a BUT1 press */ 
 
 /* PWM configuration */
-unsigned int pwmPeriod_us = 1000;       /* PWM priod in us */
-unsigned int dcValue = 33;              /* Duty-cycle in % */
+unsigned int pwmPeriod_us = 10000;       /* PWM priod in us */
+unsigned int dcValue = 0;              /* Duty-cycle in % */
                                                         /* PWM ENDS   */
+int objective = 0;
+int ambience_light = 0;
 
-
+/* More Global Vars */
+//Clock
+int segundos = 0;
+int minutos = 0;
+int horas = 0;
+//Control
+int setpoint = 1500;
+int mode = MODE_AUTO;
+int auto_workmode = AUTO_WORKMODE_OFF;
+int start_hour = 1;
+int end_hour = 4;
+int end_minute = 0;
+int workmode_flip = 0;
 
 /* Takes one sample */
 static int adc_sample(void)
@@ -168,8 +204,49 @@ static int adc_sample(void)
 // ISR
 void but1press_cbfunction(const struct device *dev, struct gpio_callback *cb, uint32_t pins){
     
-    /* Update Flag*/
-    dcToggleFlag1 = 1;
+    /* Test each button ...*/
+    if(BIT(BOARDBUT1) & pins) {
+       if(mode == MODE_AUTO){
+        mode = MODE_MANUAL;
+       }
+       else{
+        mode = MODE_AUTO;
+       }
+    }
+
+    if(BIT(BOARDBUT2) & pins) {
+      if(workmode_flip){
+        workmode_flip = 0;
+      }
+      else{
+        workmode_flip = 1;
+      }
+
+    }
+
+    if(BIT(BOARDBUT3) & pins) {
+      if(mode == MODE_MANUAL){
+        /* Update global var*/        
+        if (dcValue <= 95){
+          dcValue = dcValue + 5;
+        }
+        else{
+          dcValue = 0;
+        }
+      }
+    }
+
+    if(BIT(BOARDBUT4) & pins) {
+      if(mode == MODE_MANUAL){
+        /* Update global var*/
+        if (dcValue >= 5){
+          dcValue = dcValue - 5;
+        }
+        else{
+          dcValue = 100;
+        }        
+      } 
+    }
 }
 
 // CONFIG
@@ -264,13 +341,22 @@ void config(void){
 
 void main(void)
 {
+   printk("\x1b[2J");  /* Clear screen */
+   printk("\x1b[H");   // Send cursor to home
    config();
-
+   
+    
    /* Create and init semaphores */
     k_sem_init(&sem1, 0, 1);
     k_sem_init(&sem2, 0, 1);
+    k_sem_init(&sem3, 0, 1);
+
     
     /* Create tasks */
+    thread_Clock_tid = k_thread_create(&thread_Clock_data, thread_Clock_stack,
+        K_THREAD_STACK_SIZEOF(thread_Clock_stack), Clock,
+        NULL, NULL, NULL, thread_Clock_prio, 0, K_NO_WAIT);
+
     thread_In_tid = k_thread_create(&thread_In_data, thread_In_stack,
         K_THREAD_STACK_SIZEOF(thread_In_stack), Input,
         NULL, NULL, NULL, thread_In_prio, 0, K_NO_WAIT);
@@ -278,6 +364,10 @@ void main(void)
     thread_Filter_tid = k_thread_create(&thread_Filter_data, thread_Filter_stack,
         K_THREAD_STACK_SIZEOF(thread_Filter_stack), Filter,
         NULL, NULL, NULL, thread_Filter_prio, 0, K_NO_WAIT);
+    
+    thread_Control_tid = k_thread_create(&thread_Control_data, thread_Control_stack,
+        K_THREAD_STACK_SIZEOF(thread_Control_stack), Control,
+        NULL, NULL, NULL, thread_Control_prio, 0, K_NO_WAIT);
 
     thread_Out_tid = k_thread_create(&thread_Out_data, thread_Out_stack,
         K_THREAD_STACK_SIZEOF(thread_Out_stack), Output,
@@ -306,6 +396,53 @@ void main(void)
     }*/
 }
 
+void Clock(void *argA , void *argB, void *argC)
+{
+  int64_t time_stamp;
+  int64_t release_time;
+  while(1)
+  {
+    printk("Clock thread init\n");
+    segundos = 0;
+    minutos = 0;
+    horas = 0;
+    release_time = k_uptime_get() + 10;
+    while(horas <= 24)
+    {
+      time_stamp = k_uptime_get();
+      if( time_stamp < release_time)
+      {
+        k_msleep(release_time - time_stamp);
+        release_time += 10;
+        segundos++;               // segundos        
+        if (segundos >= 60)
+        {
+          minutos++;             // minutos
+          segundos = 0;
+        }                                              
+        if (minutos >= 60)
+        {
+          horas++;                // horas
+          minutos = 0;
+        }                                                                  
+      }
+      if (horas >= start_hour && (horas <= end_hour && minutos <= end_minute)){
+        auto_workmode = AUTO_WORKMODE_ON;
+        if (workmode_flip){
+          auto_workmode = AUTO_WORKMODE_OFF;
+        }
+      }
+      else{
+        auto_workmode = AUTO_WORKMODE_OFF;
+        if (workmode_flip){
+          auto_workmode = AUTO_WORKMODE_ON;
+        }
+      }
+    }
+  }
+}
+
+
 void Input(void *argA , void *argB, void *argC)
 {
     /* Timing variables to control task periodicity */
@@ -315,48 +452,62 @@ void Input(void *argA , void *argB, void *argC)
     int16_t input;
     int err=0;
     
-    printk("Input (task A) thread init (periodic)\n");
     printk("\x1b[2J"); /* Clear screen */
     /* Compute next release instant */
     release_time = k_uptime_get() + SAMP_PERIOD_MS;
 
     
     /* Thread loop */
-    while(1) {
-        
-        printk("\x1b[H");   // Send cursor to home
-        printf("\x1B[?25l");   // Hide cursor
-        // printk("\x1b[2J");  /* Clear screen */
+    while(1)
+    {   
+      //printk("Read thread init\n");
+      printk("\x1b[H");   // Send cursor to home
+      printf("\x1B[?25l");   // Hide cursor
+      // printk("\x1b[2J");  /* Clear screen */
+      if (mode == MODE_AUTO){
+        if (auto_workmode == AUTO_WORKMODE_OFF){
+          printk("Mode: AUTO State: OFF\x1b[0K\n");
+        }
+        else{
+          printk("Mode: AUTO State: ON\x1b[0K\n");
+        }
+      }
+      else{
+        printk("Mode: MANUAL\x1b[0K\n");
+      }
+      printk("Setpoint: %d\x1b[0K\n",setpoint);
+
+      /* Do the workload */
+      err=adc_sample();
+      if(err)
+      {
+          printk("adc_sample() failed with error code %d\n",err);
+      }
+      else
+      {
+          if(adc_sample_buffer[0] > 1023) {
+              printk("adc reading out of range\n");
+          }
+          else {
+              input = (uint16_t)(1000*adc_sample_buffer[0]*((float)3/1023));
+              printk("Actual Sample: %d\x1b[0K\n", input);
+            
+              /* ADC is set to use gain of 1/4 and reference VDD/4, so input range is 0...VDD (3 V), with 10 bit resolution */
+              //printk("adc reading: raw:%4u / %4u mV: \n\r",adc_sample_buffer[0],(uint16_t)(1000*adc_sample_buffer[0]*((float)3/1023)));
+          }
+      }
     
-        /* Do the workload */
-        err=adc_sample();
-        if(err) {
-            printk("adc_sample() failed with error code %d\n",err);
-        }
-        else {
-            if(adc_sample_buffer[0] > 1023) {
-                printk("adc reading out of range\n");
-            }
-            else {
-                input = (uint16_t)(1000*adc_sample_buffer[0]*((float)3/1023));
-                printk("Actual Sample: %d\x1b[0K\n", input);
-                
-                /* ADC is set to use gain of 1/4 and reference VDD/4, so input range is 0...VDD (3 V), with 10 bit resolution */
-                //printk("adc reading: raw:%4u / %4u mV: \n\r",adc_sample_buffer[0],(uint16_t)(1000*adc_sample_buffer[0]*((float)3/1023)));
-            }
-        }
-        
-        sm_1= input;
-        
-        k_sem_give(&sem1);
+      sharedmemory_1= input;
+    
+      k_sem_give(&sem1);
 
-        /* Wait for next release instant */ 
-        fin_time = k_uptime_get();
-        if( fin_time < release_time) {
-            k_msleep(release_time - fin_time);
-            release_time += SAMP_PERIOD_MS;
+      /* Wait for next release instant */ 
+      fin_time = k_uptime_get();
+      if( fin_time < release_time) {
+          k_msleep(release_time - fin_time);
+          release_time += SAMP_PERIOD_MS;
 
-        }
+      }
     }
 }
 
@@ -364,75 +515,130 @@ void Filter(void *argA , void *argB, void *argC)
 {
     /* Other variables */
     static int local_vect[VECTOR_SIZE] = {0,0,0,0,0};
-    int avg_total;
-    static int avg_rem;
     int sum;
-    int remaining_samples;
 
     while(1) {
+        //printk("Filter thread init\n");
         k_sem_take(&sem1,  K_FOREVER);
        
         for (int i = 0; i<VECTOR_SIZE-1; i++){ //Local_Vector[] <- Shared memory 1
           local_vect[i] = local_vect[i+1];
 
         }
-        local_vect[VECTOR_SIZE-1] = sm_1;
+        local_vect[VECTOR_SIZE-1] = sharedmemory_1;
         
         sum = 0;
         for (int i = 0; i<VECTOR_SIZE; i++){ // Media com todas as amostras
           sum = sum + local_vect[i];
 
         }
-        avg_total = sum /VECTOR_SIZE;
-        printk("AVG_Total %d\x1b[0K\n",avg_total);
-
-        sum = 0;
-        remaining_samples = 0;
-        for (int i = 0; i<VECTOR_SIZE; i++){ // Media sem outliars
-          if (local_vect[i] < 300+avg_total && local_vect[i] > 300-avg_total){
-            sum = sum + local_vect[i];
-
-            remaining_samples++;
+        printk("AVG_Total %d\x1b[0K\n",sum /VECTOR_SIZE);
+        
+        if(mode == MODE_AUTO){
+          if (auto_workmode == AUTO_WORKMODE_ON){
+             sharedmemory_2 = sum /VECTOR_SIZE;
+             k_sem_give(&sem2);
           }
+          else{
+            dcValue = 0;
+            k_sem_give(&sem3);
+          }
+         
         }
-        printk("Remaining Samples Consideradas -> %d\x1b[0K\n",remaining_samples);
-
-        if (remaining_samples>0){
-          avg_rem = sum/remaining_samples;
+        if(mode == MODE_MANUAL){        
+          k_sem_give(&sem3);
         }
-        else{
-          printk("ALL OUTLIAR\x1b[0K\n");
-        }
-        sm_2=avg_rem;
-
-        k_sem_give(&sem2);    
+            
   }
+}
+
+void Control(void *argA , void *argB, void *argC)
+{
+  float Ki=0.005;
+  float Kp=0.5;
+  int input=0;
+  int error=0;
+  int integral_error=0;
+  int output=0;
+   
+  while(1)
+  {
+    //printk("Control thread init\n");
+    k_sem_take(&sem2,  K_FOREVER);
+    input = sharedmemory_2;
+    error = (setpoint-input)/30;
+
+    output = (Kp*error + Ki*integral_error);    // New Duty Cycle value to achieve the desired 
+
+    // Anti-windup -> Limits the effect of I
+
+    if(((output >= 100) || (output <= 0))  && (((error >= 0) && (integral_error >= 0)) || ((error < 0) && (integral_error < 0))))
+    {
+      integral_error = integral_error;
+    }
+    else
+    {
+      integral_error = integral_error + error;
+    }
+    
+    // Limit output
+    if (output > 100)
+    {
+        output = 100;
+    }
+    if (output < 0)
+    {
+        output = 0;
+    }
+
+    printk("Controlled Duty_Cycle %d\x1b[0K\n",output);
+    sharedmemory_3 = output;
+
+    k_sem_give(&sem3); 
+    
+  }
+      
+
 }
 
 void Output(void *argA , void *argB, void *argC)
 {
-    /* Other variables */
-    int output;
+    /* Local variables */
     int ret = 0;
+    while(1)
+    {
+        //printk("Output thread init\n");
 
-
-    while(1) {
-        k_sem_take(&sem2,  K_FOREVER);
-        output= sm_2;
-        dcValue = (100*output)/3000;
-        printk("Output = %d\x1b[0K\n", output);
+        k_sem_take(&sem3,  K_FOREVER);
+        if (mode == MODE_AUTO){
+          if (auto_workmode == AUTO_WORKMODE_ON){
+            dcValue = sharedmemory_3;
+          }
+          else{
+            dcValue = 0;
+          }
+        }
+        
+        
+        //dcValue = (100*output)/3000;
+        //printk("Output = %d\x1b[0K\n", output);
         printk("PWM DC value set to %u %%\x1b[0K\n",dcValue);
 
-        ret = pwm_pin_set_usec(pwm0_dev, BOARDLED_OUT,
-                  pwmPeriod_us,(unsigned int)((pwmPeriod_us*dcValue)/100), PWM_POLARITY_NORMAL);
-        if (ret) {
+        ret = pwm_pin_set_usec(pwm0_dev, BOARDLED_OUT, pwmPeriod_us,(unsigned int)((pwmPeriod_us*(100-dcValue))/100), PWM_POLARITY_NORMAL);
+
+        if (ret)
+        {
             printk("Error %d: failed to set pulse width\n", ret);
         }
-        if (dcToggleFlag1){
+
+        if (dcToggleFlag1)
+        {
             printk("But 1 pressed!");
             dcToggleFlag1 = 0;
         }
+        
+        printk("Time-> %d h %d min %d sec \x1b[0K\n",horas, minutos, segundos);
         printk("\x1b[0J"); // Erase from cursor to end of screen
         
-  }
+    }
 }
